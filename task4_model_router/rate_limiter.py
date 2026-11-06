@@ -38,6 +38,8 @@ from typing import TypeVar
 
 T = TypeVar("T")
 
+STARTUP_LOCK_WAIT_S = 10.0
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS token_usage (
     id     INTEGER PRIMARY KEY,
@@ -78,11 +80,23 @@ class TokenRateLimiter:
     @staticmethod
     def _open(db_path: str) -> sqlite3.Connection:
         conn = sqlite3.connect(db_path, isolation_level=None, check_same_thread=False)
-        conn.execute("PRAGMA busy_timeout=5000")  # first, so setup below waits too
-        conn.execute("PRAGMA journal_mode=WAL")  # readers do not block the writer
-        conn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, far fewer fsyncs
-        conn.executescript(SCHEMA)
-        return conn
+        conn.execute("PRAGMA busy_timeout=5000")
+        # SQLite can refuse the switch to WAL at once, without honouring
+        # busy_timeout, when workers open a new file together. So startup waits
+        # for the lock itself. Every step here is safe to repeat.
+        deadline = time.monotonic() + STARTUP_LOCK_WAIT_S
+        while True:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")  # readers do not block the writer
+                conn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL, far fewer fsyncs
+                conn.executescript(SCHEMA)
+                return conn
+            except sqlite3.OperationalError as error:
+                busy = error.sqlite_errorcode & 0xFF == sqlite3.SQLITE_BUSY
+                if not busy or time.monotonic() >= deadline:
+                    conn.close()
+                    raise
+                time.sleep(0.05)
 
     def _now_ms(self) -> int:
         return int(self._clock() * 1000)

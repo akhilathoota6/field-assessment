@@ -142,7 +142,9 @@ Reserving first is what stops 100 concurrent requests from seeing the same free 
 **Concurrency:** each transaction is one synchronous function on a dedicated single-thread
 executor, so coroutines can't interleave inside check-then-insert and the event loop never blocks
 on disk. `BEGIN IMMEDIATE` gives the same guarantee across processes, tested with four real
-processes racing for one tenant's budget in one file.
+processes racing for one tenant's budget in one file. That test also found a startup crash:
+SQLite can refuse the switch to WAL at once, ignoring `busy_timeout`, when workers open a new file
+together. Startup now retries on a lock for up to 10 seconds, and any other error fails immediately.
 
 **Eviction:** a tenant's expired rows go on each `reserve`, and a background sweep removes rows
 for tenants who went quiet.

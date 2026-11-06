@@ -200,6 +200,59 @@ def test_separate_processes_never_over_admit(tmp_path):
     assert sum(int(stdout) for stdout, _ in outputs) == 50
 
 
+def busy_error():
+    error = sqlite3.OperationalError("database is locked")
+    error.sqlite_errorcode = sqlite3.SQLITE_BUSY
+    return error
+
+
+def connect_failing_wal_switch(monkeypatch, failures, error_factory=busy_error):
+    """SQLite can refuse the switch to WAL at once, ignoring busy_timeout."""
+    real_connect = sqlite3.connect
+    remaining = [failures]
+
+    class Connection(sqlite3.Connection):
+        def execute(self, sql, *args):
+            if "journal_mode" in sql and remaining[0] > 0:
+                remaining[0] -= 1
+                raise error_factory()
+            return super().execute(sql, *args)
+
+    monkeypatch.setattr(
+        module.sqlite3, "connect", lambda *a, **k: real_connect(*a, factory=Connection, **k)
+    )
+    return remaining
+
+
+async def test_startup_retries_when_another_process_holds_the_lock(tmp_path, monkeypatch):
+    remaining = connect_failing_wal_switch(monkeypatch, failures=3)
+    instance = TokenRateLimiter(tmp_path / "busy.db", limit=50_000)
+    try:
+        assert remaining[0] == 0
+        assert (await instance.reserve("t", 1_000)).allowed
+    finally:
+        await instance.close()
+
+
+def test_startup_gives_up_if_the_lock_never_clears(tmp_path, monkeypatch):
+    connect_failing_wal_switch(monkeypatch, failures=10_000)
+    monkeypatch.setattr(module, "STARTUP_LOCK_WAIT_S", 0.1)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        TokenRateLimiter(tmp_path / "stuck.db", limit=50_000)
+
+
+def test_startup_does_not_retry_other_errors(tmp_path, monkeypatch):
+    def disk_error():
+        error = sqlite3.OperationalError("disk I/O error")
+        error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+        return error
+
+    remaining = connect_failing_wal_switch(monkeypatch, failures=5, error_factory=disk_error)
+    with pytest.raises(sqlite3.OperationalError, match="disk"):
+        TokenRateLimiter(tmp_path / "bad.db", limit=50_000)
+    assert remaining[0] == 4  # failed on the first attempt
+
+
 async def test_state_survives_a_restart(tmp_path, clock):
     path = tmp_path / "persist.db"
     first = TokenRateLimiter(path, limit=50_000, clock=clock)
