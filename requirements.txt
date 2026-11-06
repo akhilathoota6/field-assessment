@@ -1,0 +1,9 @@
+mcp==2.3.0
+pydantic==2.14.3
+starlette==1.10.0
+uvicorn==0.54.0
+httpx==0.28.1
+PyJWT==2.15.1
+anyio>=4.5
+pytest==9.2.0
+pytest-asyncio==1.4.1.post1
